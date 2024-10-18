@@ -235,25 +235,42 @@ class ExportTSDFMesh(Exporter):
             bounding_box_min=self.bounding_box_min,
             bounding_box_max=self.bounding_box_max,
         )
+class ExportTSDFMeshCuda(Exporter):
+    """
+    Export a mesh using Open3D's TSDF processing.
+    """
 
-        # possibly
-        # texture the mesh with NeRF and export to a mesh.obj file
-        # and a material and texture file
-        if self.texture_method == "nerf":
-            # load the mesh from the tsdf export
-            mesh = get_mesh_from_filename(
-                str(self.output_dir / "tsdf_mesh.ply"), target_num_faces=self.target_num_faces
-            )
-            CONSOLE.print("Texturing mesh with NeRF")
-            texture_utils.export_textured_mesh(
-                mesh,
-                pipeline,
-                self.output_dir,
-                px_per_uv_triangle=self.px_per_uv_triangle if self.unwrap_method == "custom" else None,
-                unwrap_method=self.unwrap_method,
-                num_pixels_per_side=self.num_pixels_per_side,
-            )
+    downscale_factor: int = 1
+    """Downscale the images starting from the resolution used for training."""
+    depth_output_name: str = "depth"
+    """Name of the depth output."""
+    rgb_output_name: str = "rgb"
+    """Name of the RGB output."""
+    voxel_size: int = 0.01
+    """Voxel Size for TSDF method"""
+    block_resoultion: int = 8
+    """Block Resolution."""
+    block_count: int = 5000
+    """Block Count for the TSDF volume."""
 
+    def main(self) -> None:
+        """Export mesh"""
+
+        if not self.output_dir.exists():
+            self.output_dir.mkdir(parents=True)
+
+        _, pipeline, _, _ = eval_setup(self.load_config)
+
+        tsdf_utils.export_tsdf_mesh_cuda(
+            pipeline,
+            self.output_dir,
+            self.downscale_factor,
+            self.depth_output_name,
+            self.rgb_output_name,
+            self.voxel_size,
+            self.block_resoultion,
+            self.block_count,
+        )
 
 @dataclass
 class ExportPoissonMesh(Exporter):
@@ -328,7 +345,6 @@ class ExportPoissonMesh(Exporter):
             crop_obb = OrientedBox.from_params(self.obb_center, self.obb_rotation, self.obb_scale)
         else:
             crop_obb = None
-
         pcd = generate_point_cloud(
             pipeline=pipeline,
             num_points=self.num_points,
@@ -351,7 +367,7 @@ class ExportPoissonMesh(Exporter):
             CONSOLE.print("[bold green]:white_check_mark: Saving Point Cloud")
 
         CONSOLE.print("Computing Mesh... this may take a while.")
-        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=9)
+        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=10)
         vertices_to_remove = densities < np.quantile(densities, 0.1)
         mesh.remove_vertices_by_mask(vertices_to_remove)
         print("\033[A\033[A")
@@ -364,20 +380,20 @@ class ExportPoissonMesh(Exporter):
 
         # This will texture the mesh with NeRF and export to a mesh.obj file
         # and a material and texture file
-        if self.texture_method == "nerf":
-            # load the mesh from the poisson reconstruction
-            mesh = get_mesh_from_filename(
-                str(self.output_dir / "poisson_mesh.ply"), target_num_faces=self.target_num_faces
-            )
-            CONSOLE.print("Texturing mesh with NeRF")
-            texture_utils.export_textured_mesh(
-                mesh,
-                pipeline,
-                self.output_dir,
-                px_per_uv_triangle=self.px_per_uv_triangle if self.unwrap_method == "custom" else None,
-                unwrap_method=self.unwrap_method,
-                num_pixels_per_side=self.num_pixels_per_side,
-            )
+        # if self.texture_method == "nerf":
+        #     # load the mesh from the poisson reconstruction
+        #     mesh = get_mesh_from_filename(
+        #         str(self.output_dir / "poisson_mesh.ply"), target_num_faces=self.target_num_faces
+        #     )
+        #     CONSOLE.print("Texturing mesh with NeRF")
+        #     texture_utils.export_textured_mesh(
+        #         mesh,
+        #         pipeline,
+        #         self.output_dir,
+        #         px_per_uv_triangle=self.px_per_uv_triangle if self.unwrap_method == "custom" else None,
+        #         unwrap_method=self.unwrap_method,
+        #         num_pixels_per_side=self.num_pixels_per_side,
+        #     )
 
 
 @dataclass
@@ -411,8 +427,11 @@ class ExportMarchingCubesMesh(Exporter):
         _, pipeline, _, _ = eval_setup(self.load_config)
 
         # TODO: Make this work with Density Field
-        assert hasattr(pipeline.model.config, "sdf_field"), "Model must have an SDF field."
-
+        # assert hasattr(pipeline.model.config, "sdf_field"), "Model must have an SDF field."
+        if hasattr(pipeline.model.config, "sdf_field"):
+            geometry_callable_field_fn = lambda x: cast(SDFField, pipeline.model.field).forward_geonetwork(x)[:, 0].contiguous()
+        else:
+            geometry_callable_field_fn = lambda x: pipeline.model.field.density_fn(x)[:, 0].contiguous()
         CONSOLE.print("Extracting mesh with marching cubes... which may take a while")
 
         assert self.resolution % 512 == 0, f"""resolution must be divisible by 512, got {self.resolution}.
@@ -421,9 +440,10 @@ class ExportMarchingCubesMesh(Exporter):
 
         # Extract mesh using marching cubes for sdf at a multi-scale resolution.
         multi_res_mesh = generate_mesh_with_multires_marching_cubes(
-            geometry_callable_field=lambda x: cast(SDFField, pipeline.model.field)
-            .forward_geonetwork(x)[:, 0]
-            .contiguous(),
+            # geometry_callable_field=lambda x: cast(SDFField, pipeline.model.field)
+            # .forward_geonetwork(x)[:, 0]
+            # .contiguous(),
+            geometry_callable_field=geometry_callable_field_fn,
             resolution=self.resolution,
             bounding_box_min=self.bounding_box_min,
             bounding_box_max=self.bounding_box_max,
@@ -452,8 +472,35 @@ class ExportCameraPoses(Exporter):
     Export camera poses to a .json file.
     """
 
+    def ind(self, c2w):
+        if len(c2w) == 3:
+            c2w += [[0, 0, 0, 1]]
+        return c2w
+
+
+    def combine_transforms(self, train_frames, eval_frames, output_filepath):
+        
+        transforms = train_frames + eval_frames
+
+        out = {
+                'camera_type': 'perspective',
+                'render_height': 1080,
+                'render_width': 1920,
+                'seconds': len(transforms),
+                'camera_path': [
+                    {'camera_to_world': self.ind(pose['transform']), 'fov': 50, 'aspect': 1, 'file_path': pose['file_path']}
+                    for pose in transforms
+                    ]
+                }
+
+        outstr = json.dumps(out, indent=4)
+        with open(output_filepath, mode='w', encoding="UTF-8") as f:
+            f.write(outstr)
+
+
     def main(self) -> None:
         """Export camera poses"""
+        CONSOLE.print(f"output_dir: {self.output_dir}")
         if not self.output_dir.exists():
             self.output_dir.mkdir(parents=True)
 
@@ -472,6 +519,12 @@ class ExportCameraPoses(Exporter):
                 json.dump(frames, f, indent=4)
 
             CONSOLE.print(f"[bold green]:white_check_mark: Saved poses to {output_file_path}")
+
+        combined_transforms_filepath = os.path.join(self.output_dir, "camera_path.json")
+        self.combine_transforms(train_frames, eval_frames, combined_transforms_filepath)
+        CONSOLE.print(f"[bold green]:white_check_mark: Saved poses to {combined_transforms_filepath}")
+
+        
 
 
 @dataclass
@@ -552,6 +605,7 @@ class ExportGaussianSplat(Exporter):
         model: SplatfactoModel = pipeline.model
 
         filename = self.output_dir / "splat.ply"
+        pcdfilename = self.output_dir / "point_cloud.ply"
 
         count = 0
         map_to_tensors = OrderedDict()
@@ -577,6 +631,12 @@ class ExportGaussianSplat(Exporter):
                 shs_rest = shs_rest.reshape((n, -1))
                 for i in range(shs_rest.shape[-1]):
                     map_to_tensors[f"f_rest_{i}"] = shs_rest[:, i, None]
+                
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(positions)
+                colors = torch.clamp(model.colors.clone(), 0.0, 1.0).data.cpu().numpy()
+                pcd.colors = o3d.utility.Vector3dVector(colors)
+                o3d.io.write_point_cloud(str(pcdfilename), pcd)
             else:
                 colors = torch.clamp(model.colors.clone(), 0.0, 1.0).data.cpu().numpy()
                 map_to_tensors["colors"] = (colors * 255).astype(np.uint8)
@@ -616,9 +676,8 @@ class ExportGaussianSplat(Exporter):
             for k, t in map_to_tensors.items():
                 map_to_tensors[k] = map_to_tensors[k][select]
             count = np.sum(select)
-
+     
         ExportGaussianSplat.write_ply(str(filename), count, map_to_tensors)
-
 
 Commands = tyro.conf.FlagConversionOff[
     Union[
@@ -628,6 +687,7 @@ Commands = tyro.conf.FlagConversionOff[
         Annotated[ExportMarchingCubesMesh, tyro.conf.subcommand(name="marching-cubes")],
         Annotated[ExportCameraPoses, tyro.conf.subcommand(name="cameras")],
         Annotated[ExportGaussianSplat, tyro.conf.subcommand(name="gaussian-splat")],
+        Annotated[ExportTSDFMeshCuda, tyro.conf.subcommand(name="tsdf-cuda")],
     ]
 ]
 
