@@ -494,6 +494,7 @@ class ExportCameraPoses(Exporter):
                 }
 
         outstr = json.dumps(out, indent=4)
+        CONSOLE.print(f"Saving camera poses to {output_filepath}")
         with open(output_filepath, mode='w', encoding="UTF-8") as f:
             f.write(outstr)
 
@@ -696,11 +697,15 @@ Commands = tyro.conf.FlagConversionOff[
 
 def entrypoint():
     """Entrypoint for use with pyproject scripts."""
+    print("Running exporter script directly.")
+    print("HIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII")
     tyro.extras.set_accent_color("bright_yellow")
     tyro.cli(Commands).main()
 
 
 if __name__ == "__main__":
+    print("Running exporter script directly.")
+    print("HIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII")
     entrypoint()
 
 
