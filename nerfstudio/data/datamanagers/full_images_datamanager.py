@@ -400,7 +400,6 @@ def _undistort_image(
     """
     mask = None
     cam_type = camera.camera_type.item()
-    print(f"[Debug] undistort_image: initial camera_type={cam_type}, distortion={distortion_params.tolist()}")
 
     # PERSPECTIVE / OPENCV
     if cam_type == CameraType.PERSPECTIVE.value:
@@ -414,7 +413,6 @@ def _undistort_image(
             camera.camera_type = torch.tensor([CameraType.FISHEYE.value], dtype=torch.int32)
             cam_type = CameraType.FISHEYE.value
         else:
-            print("[Debug] using OPENCV pinhole undistort")
             # reorder to OpenCV: (k1, k2, p1, p2, k3)
             dist_ocv = np.array([
                 distortion_params[0],  # k1
@@ -443,7 +441,6 @@ def _undistort_image(
 
     # OPENCV_FISHEYE
     if cam_type == CameraType.FISHEYE.value:
-        print("[Debug] using OPENCV fisheye undistort")
         # shift principal point
         K[0, 2] -= 0.5
         K[1, 2] -= 0.5
@@ -467,5 +464,4 @@ def _undistort_image(
     if cam_type not in (CameraType.PERSPECTIVE.value, CameraType.FISHEYE.value):
         raise NotImplementedError(f"Undistort not implemented for camera_type={cam_type}")
 
-    print(f"[Debug] undistort_image: final camera_type={camera.camera_type.item()}")
     return K, image, mask
