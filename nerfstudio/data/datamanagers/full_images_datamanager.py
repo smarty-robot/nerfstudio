@@ -387,179 +387,85 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
 
 
 def _undistort_image(
-    camera: Cameras, distortion_params: np.ndarray, data: dict, image: np.ndarray, K: np.ndarray
+    camera: Cameras,
+    distortion_params: np.ndarray,
+    data: dict,
+    image: np.ndarray,
+    K: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, Optional[torch.Tensor]]:
+    """
+    Undistort an image for either pinhole (OPENCV) or fisheye.
+    If the 4th Brown parameter is non-zero for a PERSPECTIVE camera, 
+    it will automatically switch to FISHEYE undistortion.
+    """
     mask = None
-    if camera.camera_type.item() == CameraType.PERSPECTIVE.value:
-        assert distortion_params[3] == 0, (
-            "We doesn't support the 4th Brown parameter for image undistortion, "
-            "Only k1, k2, k3, p1, p2 can be non-zero."
-        )
-        # because OpenCV expects the order of distortion parameters to be (k1, k2, p1, p2, k3), we need to reorder them
-        # see https://docs.opencv.org/4.x/dc/dbb/tutorial_py_calibration.html
-        distortion_params = np.array(
-            [
-                distortion_params[0],
-                distortion_params[1],
-                distortion_params[4],
-                distortion_params[5],
-                distortion_params[2],
-                distortion_params[3],
-                0,
-                0,
-            ]
-        )
-        # because OpenCV expects the pixel coord to be top-left, we need to shift the principal point by 0.5
-        # see https://github.com/nerfstudio-project/nerfstudio/issues/3048
-        K[0, 2] = K[0, 2] - 0.5
-        K[1, 2] = K[1, 2] - 0.5
-        if np.any(distortion_params):
-            newK, roi = cv2.getOptimalNewCameraMatrix(K, distortion_params, (image.shape[1], image.shape[0]), 0)
-            image = cv2.undistort(image, K, distortion_params, None, newK)  # type: ignore
-        else:
-            newK = K
-            roi = 0, 0, image.shape[1], image.shape[0]
-        # crop the image and update the intrinsics accordingly
-        x, y, w, h = roi
-        image = image[y : y + h, x : x + w]
-        # update the principal point based on our cropped region of interest (ROI)
-        newK[0, 2] -= x
-        newK[1, 2] -= y
-        if "depth_image" in data:
-            data["depth_image"] = data["depth_image"][y : y + h, x : x + w]
-        if "mask" in data:
-            mask = data["mask"].numpy()
-            mask = mask.astype(np.uint8) * 255
-            if np.any(distortion_params):
-                mask = cv2.undistort(mask, K, distortion_params, None, newK)  # type: ignore
-            mask = mask[y : y + h, x : x + w]
-            mask = torch.from_numpy(mask).bool()
-            if len(mask.shape) == 2:
-                mask = mask[:, :, None]
-        newK[0, 2] = newK[0, 2] + 0.5
-        newK[1, 2] = newK[1, 2] + 0.5
-        K = newK
+    cam_type = camera.camera_type.item()
+    print(f"[Debug] undistort_image: initial camera_type={cam_type}, distortion={distortion_params.tolist()}")
 
-    elif camera.camera_type.item() == CameraType.FISHEYE.value:
-        K[0, 2] = K[0, 2] - 0.5
-        K[1, 2] = K[1, 2] - 0.5
-        distortion_params = np.array(
-            [distortion_params[0], distortion_params[1], distortion_params[2], distortion_params[3]]
-        )
+    # PERSPECTIVE / OPENCV
+    if cam_type == CameraType.PERSPECTIVE.value:
+        # if k4 (Brown’s p1/p2 slot) is non-zero, treat as fisheye instead
+        if distortion_params[3] != 0:
+            print(
+                f"[Warning] Detected non-zero 4th Brown parameter ({distortion_params[3]}) "
+                "on a PERSPECTIVE camera — switching to FISHEYE undistort."
+            )
+            # override camera type so downstream cameras.fx/fy, etc. get updated
+            camera.camera_type = torch.tensor([CameraType.FISHEYE.value], dtype=torch.int32)
+            cam_type = CameraType.FISHEYE.value
+        else:
+            print("[Debug] using OPENCV pinhole undistort")
+            # reorder to OpenCV: (k1, k2, p1, p2, k3)
+            dist_ocv = np.array([
+                distortion_params[0],  # k1
+                distortion_params[1],  # k2
+                distortion_params[4],  # p1
+                distortion_params[5],  # p2
+                distortion_params[2],  # k3
+            ], dtype=np.float64)
+            # shift principal point
+            K[0, 2] -= 0.5
+            K[1, 2] -= 0.5
+            newK, roi = cv2.getOptimalNewCameraMatrix(K, dist_ocv, (image.shape[1], image.shape[0]), 0)
+            image = cv2.undistort(image, K, dist_ocv, None, newK)
+            x, y, w, h = roi
+            image = image[y : y + h, x : x + w]
+            newK[0, 2] -= x
+            newK[1, 2] -= y
+            if "mask" in data:
+                m = data["mask"].numpy().astype(np.uint8) * 255
+                m = cv2.undistort(m, K, dist_ocv, None, newK)
+                m = m[y : y + h, x : x + w]
+                mask = torch.from_numpy(m).bool()[..., None]
+            newK[0, 2] += 0.5
+            newK[1, 2] += 0.5
+            K[:] = newK
+
+    # OPENCV_FISHEYE
+    if cam_type == CameraType.FISHEYE.value:
+        print("[Debug] using OPENCV fisheye undistort")
+        # shift principal point
+        K[0, 2] -= 0.5
+        K[1, 2] -= 0.5
+        fish_dist = distortion_params[:4].astype(np.float64)
         newK = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
-            K, distortion_params, (image.shape[1], image.shape[0]), np.eye(3), balance=0
+            K, fish_dist, (image.shape[1], image.shape[0]), np.eye(3), balance=0
         )
         map1, map2 = cv2.fisheye.initUndistortRectifyMap(
-            K, distortion_params, np.eye(3), newK, (image.shape[1], image.shape[0]), cv2.CV_32FC1
+            K, fish_dist, np.eye(3), newK, (image.shape[1], image.shape[0]), cv2.CV_32FC1
         )
-        # and then remap:
         image = cv2.remap(image, map1, map2, interpolation=cv2.INTER_LINEAR)
         if "mask" in data:
-            mask = data["mask"].numpy()
-            mask = mask.astype(np.uint8) * 255
-            mask = cv2.fisheye.undistortImage(mask, K, distortion_params, None, newK)
-            mask = torch.from_numpy(mask).bool()
-            if len(mask.shape) == 2:
-                mask = mask[:, :, None]
-        newK[0, 2] = newK[0, 2] + 0.5
-        newK[1, 2] = newK[1, 2] + 0.5
-        K = newK
-    elif camera.camera_type.item() == CameraType.FISHEYE624.value:
-        fisheye624_params = torch.cat(
-            [camera.fx, camera.fy, camera.cx, camera.cy, torch.from_numpy(distortion_params)], dim=0
-        )
-        assert fisheye624_params.shape == (16,)
-        assert (
-            "mask" not in data
-            and camera.metadata is not None
-            and "fisheye_crop_radius" in camera.metadata
-            and isinstance(camera.metadata["fisheye_crop_radius"], float)
-        )
-        fisheye_crop_radius = camera.metadata["fisheye_crop_radius"]
+            m = data["mask"].numpy().astype(np.uint8) * 255
+            m = cv2.fisheye.undistortImage(m, K, fish_dist, None, newK)
+            mask = torch.from_numpy(m).bool()[..., None]
+        newK[0, 2] += 0.5
+        newK[1, 2] += 0.5
+        K[:] = newK
 
-        # Approximate the FOV of the unmasked region of the camera.
-        upper, lower, left, right = fisheye624_unproject_helper(
-            torch.tensor(
-                [
-                    [camera.cx, camera.cy - fisheye_crop_radius],
-                    [camera.cx, camera.cy + fisheye_crop_radius],
-                    [camera.cx - fisheye_crop_radius, camera.cy],
-                    [camera.cx + fisheye_crop_radius, camera.cy],
-                ],
-                dtype=torch.float32,
-            )[None],
-            params=fisheye624_params[None],
-        ).squeeze(dim=0)
-        fov_radians = torch.max(
-            torch.acos(torch.sum(upper * lower / torch.linalg.norm(upper) / torch.linalg.norm(lower))),
-            torch.acos(torch.sum(left * right / torch.linalg.norm(left) / torch.linalg.norm(right))),
-        )
+    # --- unsupported camera types ---
+    if cam_type not in (CameraType.PERSPECTIVE.value, CameraType.FISHEYE.value):
+        raise NotImplementedError(f"Undistort not implemented for camera_type={cam_type}")
 
-        # Heuristics to determine parameters of an undistorted image.
-        undist_h = int(fisheye_crop_radius * 2)
-        undist_w = int(fisheye_crop_radius * 2)
-        undistort_focal = undist_h / (2 * torch.tan(fov_radians / 2.0))
-        undist_K = torch.eye(3)
-        undist_K[0, 0] = undistort_focal  # fx
-        undist_K[1, 1] = undistort_focal  # fy
-        undist_K[0, 2] = (undist_w - 1) / 2.0  # cx; for a 1x1 image, center should be at (0, 0).
-        undist_K[1, 2] = (undist_h - 1) / 2.0  # cy
-
-        # Undistorted 2D coordinates -> rays -> reproject to distorted UV coordinates.
-        undist_uv_homog = torch.stack(
-            [
-                *torch.meshgrid(
-                    torch.arange(undist_w, dtype=torch.float32),
-                    torch.arange(undist_h, dtype=torch.float32),
-                ),
-                torch.ones((undist_w, undist_h), dtype=torch.float32),
-            ],
-            dim=-1,
-        )
-        assert undist_uv_homog.shape == (undist_w, undist_h, 3)
-        dist_uv = (
-            fisheye624_project(
-                xyz=(
-                    torch.einsum(
-                        "ij,bj->bi",
-                        torch.linalg.inv(undist_K),
-                        undist_uv_homog.reshape((undist_w * undist_h, 3)),
-                    )[None]
-                ),
-                params=fisheye624_params[None, :],
-            )
-            .reshape((undist_w, undist_h, 2))
-            .numpy()
-        )
-        map1 = dist_uv[..., 1]
-        map2 = dist_uv[..., 0]
-
-        # Use correspondence to undistort image.
-        image = cv2.remap(image, map1, map2, interpolation=cv2.INTER_LINEAR)
-
-        # Compute undistorted mask as well.
-        dist_h = camera.height.item()
-        dist_w = camera.width.item()
-        mask = np.mgrid[:dist_h, :dist_w]
-        mask[0, ...] -= dist_h // 2
-        mask[1, ...] -= dist_w // 2
-        mask = np.linalg.norm(mask, axis=0) < fisheye_crop_radius
-        mask = torch.from_numpy(
-            cv2.remap(
-                mask.astype(np.uint8) * 255,
-                map1,
-                map2,
-                interpolation=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=0,
-            )
-            / 255.0
-        ).bool()[..., None]
-        if len(mask.shape) == 2:
-            mask = mask[:, :, None]
-        assert mask.shape == (undist_h, undist_w, 1)
-        K = undist_K.numpy()
-    else:
-        raise NotImplementedError("Only perspective and fisheye cameras are supported")
-
+    print(f"[Debug] undistort_image: final camera_type={camera.camera_type.item()}")
     return K, image, mask
