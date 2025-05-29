@@ -39,7 +39,10 @@ def get_interpolated_camera_path(cameras: Cameras, steps: int, order_poses: bool
     """
     Ks = cameras.get_intrinsics_matrices()
     poses = cameras.camera_to_worlds
-    poses, Ks = get_interpolated_poses_many(poses, Ks, steps_per_transition=steps, order_poses=order_poses)
+    times = cameras.times
+    poses, Ks, times = get_interpolated_poses_many(
+        poses, Ks, times, steps_per_transition=steps, order_poses=order_poses
+    )
 
     cameras = Cameras(
         fx=Ks[:, 0, 0],
@@ -48,6 +51,7 @@ def get_interpolated_camera_path(cameras: Cameras, steps: int, order_poses: bool
         cy=Ks[0, 1, 2],
         camera_type=cameras.camera_type[0],
         camera_to_worlds=poses,
+        times=times,
     )
     return cameras
 
@@ -149,10 +153,12 @@ def get_path_from_json(camera_path: Dict[str, Any]) -> Cameras:
     c2ws = []
     fxs = []
     fys = []
+    filenames = []
     for camera in camera_path["camera_path"]:
         # pose
         c2w = torch.tensor(camera["camera_to_world"]).view(4, 4)[:3]
         c2ws.append(c2w)
+        filenames.append(camera["file_path"])
         if camera_type in [
             CameraType.EQUIRECTANGULAR,
             CameraType.OMNIDIRECTIONALSTEREO_L,
@@ -166,14 +172,21 @@ def get_path_from_json(camera_path: Dict[str, Any]) -> Cameras:
             # field of view
             fov = camera["fov"]
             focal_length = three_js_perspective_camera_focal_length(fov, image_height)
+            focal_length = 1608.0
             fxs.append(focal_length)
             fys.append(focal_length)
+            
+            print("fov: ", fov)
+            print("focal_length: ", focal_length)
 
     # Iff ALL cameras in the path have a "time" value, construct Cameras with times
     if all("render_time" in camera for camera in camera_path["camera_path"]):
         times = torch.tensor([camera["render_time"] for camera in camera_path["camera_path"]])
     else:
         times = None
+        
+    # print("fxs: ", fxs)
+    # print("fys: ", fys)
 
     camera_to_worlds = torch.stack(c2ws, dim=0)
     fx = torch.tensor(fxs)
@@ -186,4 +199,4 @@ def get_path_from_json(camera_path: Dict[str, Any]) -> Cameras:
         camera_to_worlds=camera_to_worlds,
         camera_type=camera_type,
         times=times,
-    )
+    ), filenames
